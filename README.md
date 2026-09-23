@@ -4,6 +4,12 @@ SkillTrim controls which agent skills enter model context. It discovers existing
 
 It does not replace a skill package manager. Keep using tools such as Vercel `skills` to install and update skills. SkillTrim decides which installed skills each agent can see.
 
+## Why
+
+Agents receive the name and description of every visible skill in their startup context. As your skill library grows, so does that context, even though most tasks use only one or two skills. This wastes tokens, adds noise, and makes unrelated skills compete for attention.
+
+Skill package managers solve installation and updates, but not exposure. SkillTrim fills that gap: keep your full library installed, expose common skills automatically, put specialized skills behind explicit invocation or a group router, and hide unused skills without deleting them. Every filesystem change can be previewed and rolled back.
+
 ## Status
 
 Early development. Codex, Claude Code, Cursor, and OpenCode paths are supported on macOS and Linux. Explicit-only mode currently requires Codex or Claude Code.
