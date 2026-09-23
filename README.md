@@ -10,17 +10,17 @@ Early development. Codex, Claude Code, Cursor, and OpenCode paths are supported 
 
 SkillTrim currently manages filesystem skills in each configured `skills_dir`. Harness-managed built-ins and plugin-bundled skills remain under their harness or plugin manager and are not included in SkillTrim's context totals.
 
-## Build
+## Install
+
+```bash
+go install github.com/alexapvl/skilltrim/cmd/skilltrim@latest
+```
+
+Or build a local checkout:
 
 ```bash
 go build -o skilltrim ./cmd/skilltrim
 ./skilltrim
-```
-
-After the repository is public:
-
-```bash
-go install github.com/alexapvl/skilltrim/cmd/skilltrim@latest
 ```
 
 ## Commands
