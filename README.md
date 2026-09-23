@@ -1,4 +1,4 @@
-# SkillTrim
+# skilltrim
 
 SkillTrim controls which agent skills enter model context. It discovers existing `SKILL.md` files, measures catalog cost, and changes exposure through reversible symlinks and generated routers.
 
