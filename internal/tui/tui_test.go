@@ -33,7 +33,7 @@ func TestKeyboardFlowStagesPreviewsAndApplies(t *testing.T) {
 	}
 	m := newModel(cfg, configPath, "", "codex", cat)
 	m.width, m.height = 100, 30
-	if view := m.View(); !strings.Contains(view, "SkillTrim") || !strings.Contains(view, "alpha") {
+	if view := m.View(); !strings.Contains(view, "skilltrim") || !strings.Contains(view, "alpha") {
 		t.Fatalf("unexpected view: %s", view)
 	}
 

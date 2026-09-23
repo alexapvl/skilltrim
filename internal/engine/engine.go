@@ -384,7 +384,7 @@ func PlanGitExcludes(projectPaths map[string][]string) ([]FileChange, error) {
 		if err != nil {
 			return nil, err
 		}
-		change, changed, err := PlanFileChange(path, []byte(updated), "exclude SkillTrim project links from local Git status")
+		change, changed, err := PlanFileChange(path, []byte(updated), "exclude skilltrim project links from local Git status")
 		if err != nil {
 			return nil, err
 		}
@@ -448,7 +448,7 @@ func planGenerated(plan *Plan, agent, path, action, content, policy, reason stri
 			return
 		}
 		if _, err := os.Stat(filepath.Join(path, generatedMarker)); err != nil {
-			plan.Conflicts = append(plan.Conflicts, Conflict{Agent: agent, Path: path, Message: "generated directory lacks SkillTrim ownership marker"})
+			plan.Conflicts = append(plan.Conflicts, Conflict{Agent: agent, Path: path, Message: "generated directory lacks skilltrim ownership marker"})
 			return
 		}
 	} else if !errors.Is(statErr, os.ErrNotExist) {
@@ -480,7 +480,7 @@ func removeStaleGenerated(plan *Plan, agent, targetDir, dataDir string, desired 
 		if err != nil || !strings.HasPrefix(filepath.Clean(target)+string(os.PathSeparator), generatedRoot) || desired[target] {
 			continue
 		}
-		plan.Operations = append(plan.Operations, Operation{Action: "remove_link", Agent: agent, Path: path, Reason: "remove stale SkillTrim-generated activation"})
+		plan.Operations = append(plan.Operations, Operation{Action: "remove_link", Agent: agent, Path: path, Reason: "remove stale skilltrim-generated activation"})
 	}
 }
 
@@ -525,7 +525,7 @@ func writeGenerated(path, content, policy string) error {
 			return fmt.Errorf("refusing to replace unowned generated path %s", path)
 		}
 		if _, err := os.Stat(filepath.Join(path, generatedMarker)); err != nil {
-			return fmt.Errorf("generated directory lacks SkillTrim ownership marker: %s", path)
+			return fmt.Errorf("generated directory lacks skilltrim ownership marker: %s", path)
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("inspect generated skill %s: %w", path, err)
@@ -854,12 +854,12 @@ func mergeGitExclude(content string, patterns []string) (string, error) {
 		switch line {
 		case gitExcludeStart:
 			if inBlock || foundBlock {
-				return "", errors.New("Git exclude file contains multiple SkillTrim blocks")
+				return "", errors.New("Git exclude file contains multiple skilltrim blocks")
 			}
 			inBlock, foundBlock = true, true
 		case gitExcludeEnd:
 			if !inBlock {
-				return "", errors.New("Git exclude file contains an unmatched SkillTrim marker")
+				return "", errors.New("Git exclude file contains an unmatched skilltrim marker")
 			}
 			inBlock = false
 		default:
@@ -873,7 +873,7 @@ func mergeGitExclude(content string, patterns []string) (string, error) {
 		}
 	}
 	if inBlock {
-		return "", errors.New("Git exclude file contains an unclosed SkillTrim block")
+		return "", errors.New("Git exclude file contains an unclosed skilltrim block")
 	}
 	for _, pattern := range patterns {
 		entries[pattern] = true

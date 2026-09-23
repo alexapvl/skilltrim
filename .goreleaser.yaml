@@ -1,0 +1,29 @@
+version: 2
+
+project_name: skilltrim
+
+builds:
+  - main: ./cmd/skilltrim
+    binary: skilltrim
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - formats:
+      - tar.gz
+    name_template: "skilltrim_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  disable: true
+
+release:
+  replace_existing_artifacts: true

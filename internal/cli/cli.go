@@ -539,7 +539,7 @@ func runMove(writer io.Writer, opts options, cfg config.File, args []string) int
 	if err != nil {
 		return writeError(writer, opts.toon, err, nil, 1)
 	}
-	configChange, changed, err := engine.PlanFileChange(opts.configPath, encoded, "update SkillTrim configuration", 0o600)
+	configChange, changed, err := engine.PlanFileChange(opts.configPath, encoded, "update skilltrim configuration", 0o600)
 	if err != nil {
 		return writeError(writer, opts.toon, err, nil, 1)
 	}

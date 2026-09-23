@@ -1,35 +1,50 @@
 # skilltrim
 
-SkillTrim controls which agent skills enter model context. It discovers existing `SKILL.md` files, measures catalog cost, and changes exposure through reversible symlinks and generated routers.
+skilltrim controls which agent skills enter model context. It discovers existing `SKILL.md` files, measures catalog cost, and changes exposure through reversible symlinks and generated routers.
 
-It does not replace a skill package manager. Keep using tools such as Vercel `skills` to install and update skills. SkillTrim decides which installed skills each agent can see.
+It does not replace a skill package manager. Keep using tools such as Vercel `skills` to install and update skills. skilltrim decides which installed skills each agent can see.
 
 ## Why
 
 Agents receive the name and description of every visible skill in their startup context. As your skill library grows, so does that context, even though most tasks use only one or two skills. This wastes tokens, adds noise, and makes unrelated skills compete for attention.
 
-Skill package managers solve installation and updates, but not exposure. SkillTrim fills that gap: keep your full library installed, expose common skills automatically, put specialized skills behind explicit invocation or a group router, and hide unused skills without deleting them. Every filesystem change can be previewed and rolled back.
+Skill package managers solve installation and updates, but not exposure. skilltrim fills that gap: keep your full library installed, expose common skills automatically, put specialized skills behind explicit invocation or a group router, and hide unused skills without deleting them. Every filesystem change can be previewed and rolled back.
 
 ## Case study
 
 One real setup exposed 54 skills to each of two agent integrations. Of those, 22 belonged to one specialized tool family. Keeping every member visible made discovery noisy and charged startup context for descriptions that were rarely relevant outside that workflow.
 
-SkillTrim grouped those 22 skills behind one router per integration. The original skills stayed installed and available, but each agent only needed to discover the router first. The change was previewed, applied as reversible symlink operations, and verified with a clean follow-up plan.
+skilltrim grouped those 22 skills behind one router per integration. The original skills stayed installed and available, but each agent only needed to discover the router first. The change was previewed, applied as reversible symlink operations, and verified with a clean follow-up plan.
 
 | Integration | Visible skills | Context before | Context after | Estimated tokens saved |
 |---|---:|---:|---:|---:|
 | A | 54 → 33 | 21,422 chars | 15,069 chars | 1,588 |
 | B | 54 → 33 | 21,831 chars | 15,542 chars | 1,572 |
 
-Across both integrations, this removed 42 redundant catalog entries and saved 12,642 characters, or about 3,160 estimated tokens, from startup context. That is roughly a 29% reduction without uninstalling a skill. Token estimates use SkillTrim's approximation of four characters per token.
+Across both integrations, this removed 42 redundant catalog entries and saved 12,642 characters, or about 3,160 estimated tokens, from startup context. That is roughly a 29% reduction without uninstalling a skill. Token estimates use skilltrim's approximation of four characters per token.
 
 ## Status
 
 Early development. Codex, Claude Code, Cursor, and OpenCode paths are supported on macOS and Linux. Explicit-only mode currently requires Codex or Claude Code.
 
-SkillTrim currently manages filesystem skills in each configured `skills_dir`. Harness-managed built-ins and plugin-bundled skills remain under their harness or plugin manager and are not included in SkillTrim's context totals.
+skilltrim currently manages filesystem skills in each configured `skills_dir`. Harness-managed built-ins and plugin-bundled skills remain under their harness or plugin manager and are not included in skilltrim's context totals.
 
 ## Install
+
+Install the latest macOS or Linux release without Go:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/alexapvl/skilltrim/main/install.sh | sh
+```
+
+The installer downloads the binary matching your OS and architecture, verifies its SHA-256 checksum, and installs it to `~/.local/bin`. Override the destination or pin a version with environment variables:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/alexapvl/skilltrim/main/install.sh \
+  | SKILLTRIM_INSTALL_DIR="$HOME/bin" SKILLTRIM_VERSION=v0.1.0 sh
+```
+
+Go developers can install directly:
 
 ```bash
 go install github.com/alexapvl/skilltrim/cmd/skilltrim@latest
@@ -44,7 +59,7 @@ go build -o skilltrim ./cmd/skilltrim
 
 ## Ask your agent to audit your skills
 
-After installing SkillTrim, copy this prompt into your coding agent:
+After installing skilltrim, copy this prompt into your coding agent:
 
 ```text
 Use `skilltrim` to audit my installed agent skills. Start read-only.
@@ -175,7 +190,7 @@ CLI mutations write this config atomically. Skill source parents are recorded au
 ## Safety
 
 - Canonical skill sources are never edited or deleted.
-- SkillTrim only creates, replaces, or removes symlinks in configured agent skill directories.
+- skilltrim only creates, replaces, or removes symlinks in configured agent skill directories.
 - Real files and directories cause plan conflicts and remain untouched.
 - Every non-empty apply stores one rollback snapshot at `~/.local/state/skilltrim/latest.json`.
 - A project move stores global links, project links, config, and local Git exclusions in one rollback snapshot. Rollback also removes activation directories created by the move when they are still empty.

@@ -230,7 +230,7 @@ func (m model) requestQuit() (tea.Model, tea.Cmd) {
 
 func (m model) View() string {
 	if len(m.agents) == 0 {
-		return "SkillTrim\n\nNo agent adapters configured.\n\nq quit"
+		return "skilltrim\n\nNo agent adapters configured.\n\nq quit"
 	}
 	switch m.screen {
 	case screenPlan:
@@ -251,7 +251,7 @@ func (m model) skillsView() string {
 	if scope != "global" {
 		scope = filepath.Base(scope)
 	}
-	header := fmt.Sprintf("%s  %s  %s", accentStyle.Render("SkillTrim"), agent, dimStyle.Render(scope))
+	header := fmt.Sprintf("%s  %s  %s", accentStyle.Render("skilltrim"), agent, dimStyle.Render(scope))
 	stats := fmt.Sprintf("%d active  %d context chars  ~%d tokens", summary.Active, summary.ContextChars, summary.EstimatedTokens)
 	if summary.Explicit > 0 {
 		stats += fmt.Sprintf("  %d explicit", summary.Explicit)
