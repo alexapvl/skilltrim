@@ -153,9 +153,84 @@ func TestCLIProjectScopeDoesNotTouchGlobalLink(t *testing.T) {
 	}
 }
 
+func TestCLIMoveAcrossProjectsAndRollback(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("SKILLTRIM_HOME", home)
+	library := filepath.Join(home, ".local", "share", "agent-skills")
+	globalActive := filepath.Join(home, ".agents", "skills")
+	writeSkill(t, library, "alpha")
+	if err := os.MkdirAll(globalActive, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(library, "alpha"), filepath.Join(globalActive, "alpha")); err != nil {
+		t.Fatal(err)
+	}
+
+	projects := []string{filepath.Join(home, "one"), filepath.Join(home, "two")}
+	for _, project := range projects {
+		excludeDir := filepath.Join(project, ".git", "info")
+		if err := os.MkdirAll(excludeDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(excludeDir, "exclude"), []byte("existing\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	args := []string{"move", "alpha", "--to-project", projects[0], "--to-project", projects[1], "--agent", "all"}
+	if code, stdout := run(t, args...); code != 0 || !strings.Contains(stdout, `"status":"preview"`) {
+		t.Fatalf("preview code = %d: %s", code, stdout)
+	}
+	if _, err := filepath.EvalSymlinks(filepath.Join(globalActive, "alpha")); err != nil {
+		t.Fatalf("preview changed global link: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".config", "skilltrim", "config.toml")); !os.IsNotExist(err) {
+		t.Fatalf("preview wrote config: %v", err)
+	}
+
+	if code, stdout := run(t, append(args, "--apply")...); code != 0 || !strings.Contains(stdout, `"status":"applied"`) || !strings.Contains(stdout, `"applied":6`) {
+		t.Fatalf("apply code = %d: %s", code, stdout)
+	}
+	if _, err := os.Lstat(filepath.Join(globalActive, "alpha")); !os.IsNotExist(err) {
+		t.Fatalf("global alpha should be absent: %v", err)
+	}
+	for _, project := range projects {
+		local := filepath.Join(project, ".agents", "skills", "alpha")
+		if _, err := filepath.EvalSymlinks(local); err != nil {
+			t.Fatalf("project alpha missing: %v", err)
+		}
+		exclude, err := os.ReadFile(filepath.Join(project, ".git", "info", "exclude"))
+		if err != nil || !strings.Contains(string(exclude), "/.agents/skills/alpha") {
+			t.Fatalf("Git exclude = %q, err = %v", exclude, err)
+		}
+	}
+
+	if code, stdout := run(t, "rollback"); code != 0 || !strings.Contains(stdout, `"restored":6`) {
+		t.Fatalf("rollback code = %d: %s", code, stdout)
+	}
+	if _, err := filepath.EvalSymlinks(filepath.Join(globalActive, "alpha")); err != nil {
+		t.Fatalf("global alpha not restored: %v", err)
+	}
+	for _, project := range projects {
+		if _, err := os.Lstat(filepath.Join(project, ".agents", "skills", "alpha")); !os.IsNotExist(err) {
+			t.Fatalf("project alpha should be absent: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(project, ".agents")); !os.IsNotExist(err) {
+			t.Fatalf("project activation directory should be removed: %v", err)
+		}
+		exclude, err := os.ReadFile(filepath.Join(project, ".git", "info", "exclude"))
+		if err != nil || string(exclude) != "existing\n" {
+			t.Fatalf("Git exclude not restored: %q, err = %v", exclude, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(home, ".config", "skilltrim", "config.toml")); !os.IsNotExist(err) {
+		t.Fatalf("config should be restored to absent: %v", err)
+	}
+}
+
 func TestVersionIsBare(t *testing.T) {
 	code, stdout := run(t, "--version")
-	if code != 0 || stdout != "0.1.0-dev\n" {
+	if code != 0 || stdout != "0.1.0\n" {
 		t.Fatalf("version code = %d: %q", code, stdout)
 	}
 }

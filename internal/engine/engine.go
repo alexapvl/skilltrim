@@ -53,14 +53,23 @@ type ApplyResult struct {
 	Noop     bool   `json:"noop"`
 }
 
+type FileChange struct {
+	Path    string      `json:"path"`
+	Reason  string      `json:"reason"`
+	Content []byte      `json:"-"`
+	Mode    os.FileMode `json:"-"`
+}
+
 type RollbackResult struct {
 	Restored int  `json:"restored"`
 	Noop     bool `json:"noop"`
 }
 
 type snapshot struct {
-	CreatedAt time.Time       `json:"created_at"`
-	Entries   []snapshotEntry `json:"entries"`
+	CreatedAt   time.Time       `json:"created_at"`
+	Entries     []snapshotEntry `json:"entries"`
+	Files       []snapshotFile  `json:"files,omitempty"`
+	CreatedDirs []string        `json:"created_dirs,omitempty"`
 }
 
 type snapshotEntry struct {
@@ -70,7 +79,20 @@ type snapshotEntry struct {
 	AfterTarget  string `json:"after_target,omitempty"`
 }
 
+type snapshotFile struct {
+	Path          string      `json:"path"`
+	BeforeExists  bool        `json:"before_exists"`
+	BeforeContent string      `json:"before_content,omitempty"`
+	BeforeMode    os.FileMode `json:"before_mode,omitempty"`
+	AfterContent  string      `json:"after_content"`
+}
+
 const generatedMarker = ".skilltrim-generated"
+
+const (
+	gitExcludeStart = "# >>> skilltrim project skills >>>"
+	gitExcludeEnd   = "# <<< skilltrim project skills <<<"
+)
 
 func BuildPlan(cfg config.File, cat core.Catalog, selectedAgent, project string) (Plan, error) {
 	agents, err := selectedAgents(cfg, selectedAgent)
@@ -191,14 +213,26 @@ func BuildPlan(cfg config.File, cat core.Catalog, selectedAgent, project string)
 }
 
 func Apply(cfg config.File, plan Plan) (ApplyResult, error) {
-	if len(plan.Conflicts) > 0 {
-		return ApplyResult{}, fmt.Errorf("plan has %d conflict(s); resolve them before apply", len(plan.Conflicts))
+	return ApplyMany(cfg, []Plan{plan}, nil)
+}
+
+func ApplyMany(cfg config.File, plans []Plan, files []FileChange) (ApplyResult, error) {
+	operations, conflicts, err := flattenPlans(plans)
+	if err != nil {
+		return ApplyResult{}, err
 	}
-	if len(plan.Operations) == 0 {
+	files, err = uniqueFileChanges(files)
+	if err != nil {
+		return ApplyResult{}, err
+	}
+	if conflicts > 0 {
+		return ApplyResult{}, fmt.Errorf("plan has %d conflict(s); resolve them before apply", conflicts)
+	}
+	if len(operations) == 0 && len(files) == 0 {
 		return ApplyResult{Noop: true}, nil
 	}
 
-	for _, op := range plan.Operations {
+	for _, op := range operations {
 		if op.Action == "write_router" || op.Action == "write_proxy" {
 			if err := writeGenerated(op.Path, op.content, op.policy); err != nil {
 				return ApplyResult{}, err
@@ -207,7 +241,7 @@ func Apply(cfg config.File, plan Plan) (ApplyResult, error) {
 	}
 
 	snap := snapshot{CreatedAt: time.Now().UTC()}
-	for _, op := range plan.Operations {
+	for _, op := range operations {
 		if op.Action != "create_link" && op.Action != "replace_link" && op.Action != "remove_link" {
 			continue
 		}
@@ -216,10 +250,22 @@ func Apply(cfg config.File, plan Plan) (ApplyResult, error) {
 			return ApplyResult{}, err
 		}
 		snap.Entries = append(snap.Entries, entry)
+		if op.Action == "create_link" {
+			snap.CreatedDirs = append(snap.CreatedDirs, missingParentDirs(op.Path)...)
+		}
 	}
+	for _, change := range files {
+		entry, err := captureFile(change)
+		if err != nil {
+			return ApplyResult{}, err
+		}
+		snap.Files = append(snap.Files, entry)
+		snap.CreatedDirs = append(snap.CreatedDirs, missingParentDirs(change.Path)...)
+	}
+	snap.CreatedDirs = uniqueStrings(snap.CreatedDirs)
 
 	completed := 0
-	for _, op := range plan.Operations {
+	for _, op := range operations {
 		if op.Action != "create_link" && op.Action != "replace_link" && op.Action != "remove_link" {
 			completed++
 			continue
@@ -230,10 +276,21 @@ func Apply(cfg config.File, plan Plan) (ApplyResult, error) {
 		}
 		completed++
 	}
+	for _, change := range files {
+		mode := change.Mode
+		if mode == 0 {
+			mode = 0o644
+		}
+		if err := writeFileAtomic(change.Path, change.Content, mode); err != nil {
+			_ = restore(snap, false)
+			return ApplyResult{}, err
+		}
+		completed++
+	}
 
 	snapshotPath := filepath.Join(cfg.Settings.StateDir, "latest.json")
 	resultSnapshot := ""
-	if len(snap.Entries) > 0 {
+	if len(snap.Entries) > 0 || len(snap.Files) > 0 {
 		if err := writeJSON(snapshotPath, snap); err != nil {
 			_ = restore(snap, false)
 			return ApplyResult{}, err
@@ -262,7 +319,80 @@ func Rollback(cfg config.File) (RollbackResult, error) {
 	if err := os.Remove(path); err != nil {
 		return RollbackResult{}, fmt.Errorf("remove rollback snapshot: %w", err)
 	}
-	return RollbackResult{Restored: len(snap.Entries)}, nil
+	return RollbackResult{Restored: len(snap.Entries) + len(snap.Files)}, nil
+}
+
+func PlanFileChange(path string, content []byte, reason string, defaultMode ...os.FileMode) (FileChange, bool, error) {
+	current, err := os.ReadFile(path)
+	if err == nil && string(current) == string(content) {
+		return FileChange{}, false, nil
+	}
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return FileChange{}, false, fmt.Errorf("read %s: %w", path, err)
+	}
+	mode := os.FileMode(0o644)
+	if len(defaultMode) > 0 {
+		mode = defaultMode[0]
+	}
+	if info, statErr := os.Stat(path); statErr == nil {
+		mode = info.Mode().Perm()
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return FileChange{}, false, fmt.Errorf("inspect %s: %w", path, statErr)
+	}
+	return FileChange{Path: path, Reason: reason, Content: content, Mode: mode}, true, nil
+}
+
+func PlanGitExcludes(projectPaths map[string][]string) ([]FileChange, error) {
+	patternsByFile := map[string]map[string]bool{}
+	projects := make([]string, 0, len(projectPaths))
+	for project := range projectPaths {
+		projects = append(projects, project)
+	}
+	sort.Strings(projects)
+	for _, project := range projects {
+		root, gitDir, ok, err := findGitDir(project)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			continue
+		}
+		excludePath := filepath.Join(gitDir, "info", "exclude")
+		if patternsByFile[excludePath] == nil {
+			patternsByFile[excludePath] = map[string]bool{}
+		}
+		for _, path := range projectPaths[project] {
+			rel, err := filepath.Rel(root, path)
+			if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+				return nil, fmt.Errorf("project skill path %s is outside Git worktree %s", path, root)
+			}
+			patternsByFile[excludePath]["/"+filepath.ToSlash(rel)] = true
+		}
+	}
+	paths := make([]string, 0, len(patternsByFile))
+	for path := range patternsByFile {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	changes := make([]FileChange, 0, len(paths))
+	for _, path := range paths {
+		current, err := os.ReadFile(path)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("read Git exclude file: %w", err)
+		}
+		updated, err := mergeGitExclude(string(current), sortedStringKeys(patternsByFile[path]))
+		if err != nil {
+			return nil, err
+		}
+		change, changed, err := PlanFileChange(path, []byte(updated), "exclude SkillTrim project links from local Git status")
+		if err != nil {
+			return nil, err
+		}
+		if changed {
+			changes = append(changes, change)
+		}
+	}
+	return changes, nil
 }
 
 func planLink(plan *Plan, agent, path, target, reason string) {
@@ -476,26 +606,17 @@ func capture(path, afterTarget string) (snapshotEntry, error) {
 }
 
 func restore(snap snapshot, verify bool) error {
+	if verify {
+		if err := verifySnapshot(snap); err != nil {
+			return err
+		}
+	}
 	for i := len(snap.Entries) - 1; i >= 0; i-- {
 		entry := snap.Entries[i]
 		info, err := os.Lstat(entry.Path)
 		exists := err == nil
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("inspect %s during rollback: %w", entry.Path, err)
-		}
-		if verify {
-			if entry.AfterTarget == "" && exists {
-				return fmt.Errorf("refusing rollback: %s changed after apply", entry.Path)
-			}
-			if entry.AfterTarget != "" {
-				if !exists || info.Mode()&os.ModeSymlink == 0 {
-					return fmt.Errorf("refusing rollback: %s changed after apply", entry.Path)
-				}
-				current, linkErr := resolvedLink(entry.Path)
-				if linkErr != nil || !samePath(current, entry.AfterTarget) {
-					return fmt.Errorf("refusing rollback: %s changed after apply", entry.Path)
-				}
-			}
 		}
 		if exists {
 			if info.Mode()&os.ModeSymlink == 0 {
@@ -514,7 +635,275 @@ func restore(snap snapshot, verify bool) error {
 			}
 		}
 	}
+	for i := len(snap.Files) - 1; i >= 0; i-- {
+		entry := snap.Files[i]
+		if entry.BeforeExists {
+			mode := entry.BeforeMode
+			if mode == 0 {
+				mode = 0o644
+			}
+			if err := writeFileAtomic(entry.Path, []byte(entry.BeforeContent), mode); err != nil {
+				return fmt.Errorf("restore %s: %w", entry.Path, err)
+			}
+		} else if err := os.Remove(entry.Path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove %s during rollback: %w", entry.Path, err)
+		}
+	}
+	if err := removeEmptyDirs(snap.CreatedDirs); err != nil {
+		return err
+	}
 	return nil
+}
+
+func missingParentDirs(path string) []string {
+	var dirs []string
+	for dir := filepath.Dir(path); ; dir = filepath.Dir(dir) {
+		if _, err := os.Stat(dir); err == nil {
+			break
+		} else if !errors.Is(err, os.ErrNotExist) {
+			break
+		}
+		dirs = append(dirs, dir)
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+	}
+	return dirs
+}
+
+func uniqueStrings(values []string) []string {
+	seen := make(map[string]bool, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if !seen[value] {
+			seen[value] = true
+			result = append(result, value)
+		}
+	}
+	return result
+}
+
+func removeEmptyDirs(dirs []string) error {
+	dirs = append([]string(nil), dirs...)
+	sort.Slice(dirs, func(i, j int) bool { return len(dirs[i]) > len(dirs[j]) })
+	for _, dir := range dirs {
+		entries, err := os.ReadDir(dir)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("inspect created directory %s during rollback: %w", dir, err)
+		}
+		if len(entries) == 0 {
+			if err := os.Remove(dir); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("remove created directory %s during rollback: %w", dir, err)
+			}
+		}
+	}
+	return nil
+}
+
+func verifySnapshot(snap snapshot) error {
+	for _, entry := range snap.Entries {
+		info, err := os.Lstat(entry.Path)
+		exists := err == nil
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("inspect %s during rollback: %w", entry.Path, err)
+		}
+		if entry.AfterTarget == "" && exists {
+			return fmt.Errorf("refusing rollback: %s changed after apply", entry.Path)
+		}
+		if entry.AfterTarget != "" {
+			if !exists || info.Mode()&os.ModeSymlink == 0 {
+				return fmt.Errorf("refusing rollback: %s changed after apply", entry.Path)
+			}
+			current, linkErr := resolvedLink(entry.Path)
+			if linkErr != nil || !samePath(current, entry.AfterTarget) {
+				return fmt.Errorf("refusing rollback: %s changed after apply", entry.Path)
+			}
+		}
+	}
+	for _, entry := range snap.Files {
+		current, err := os.ReadFile(entry.Path)
+		if err != nil || string(current) != entry.AfterContent {
+			return fmt.Errorf("refusing rollback: %s changed after apply", entry.Path)
+		}
+	}
+	return nil
+}
+
+func captureFile(change FileChange) (snapshotFile, error) {
+	entry := snapshotFile{Path: change.Path, AfterContent: string(change.Content)}
+	data, err := os.ReadFile(change.Path)
+	if errors.Is(err, os.ErrNotExist) {
+		return entry, nil
+	}
+	if err != nil {
+		return entry, fmt.Errorf("read %s: %w", change.Path, err)
+	}
+	info, err := os.Stat(change.Path)
+	if err != nil {
+		return entry, fmt.Errorf("inspect %s: %w", change.Path, err)
+	}
+	entry.BeforeExists = true
+	entry.BeforeContent = string(data)
+	entry.BeforeMode = info.Mode().Perm()
+	return entry, nil
+}
+
+func flattenPlans(plans []Plan) ([]Operation, int, error) {
+	var operations []Operation
+	conflicts := 0
+	seen := map[string]Operation{}
+	for _, plan := range plans {
+		conflicts += len(plan.Conflicts)
+		for _, op := range plan.Operations {
+			if previous, ok := seen[op.Path]; ok {
+				if previous.Action != op.Action || previous.Target != op.Target {
+					return nil, conflicts, fmt.Errorf("plans contain conflicting operations for %s", op.Path)
+				}
+				continue
+			}
+			seen[op.Path] = op
+			operations = append(operations, op)
+		}
+	}
+	return operations, conflicts, nil
+}
+
+func writeFileAtomic(path string, content []byte, mode os.FileMode) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".skilltrim-*")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	defer os.Remove(name)
+	if err := tmp.Chmod(mode); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(content); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(name, path)
+}
+
+func findGitDir(project string) (string, string, bool, error) {
+	root, err := filepath.Abs(project)
+	if err != nil {
+		return "", "", false, fmt.Errorf("resolve project: %w", err)
+	}
+	for {
+		dotGit := filepath.Join(root, ".git")
+		info, err := os.Stat(dotGit)
+		if err == nil && info.IsDir() {
+			return root, dotGit, true, nil
+		}
+		if err == nil {
+			data, readErr := os.ReadFile(dotGit)
+			if readErr != nil {
+				return "", "", false, fmt.Errorf("read %s: %w", dotGit, readErr)
+			}
+			value := strings.TrimSpace(string(data))
+			if !strings.HasPrefix(value, "gitdir:") {
+				return "", "", false, fmt.Errorf("invalid Git directory file %s", dotGit)
+			}
+			gitDir := strings.TrimSpace(strings.TrimPrefix(value, "gitdir:"))
+			if !filepath.IsAbs(gitDir) {
+				gitDir = filepath.Join(root, gitDir)
+			}
+			gitDir = filepath.Clean(gitDir)
+			commonDir, commonErr := os.ReadFile(filepath.Join(gitDir, "commondir"))
+			if commonErr == nil {
+				common := strings.TrimSpace(string(commonDir))
+				if !filepath.IsAbs(common) {
+					common = filepath.Join(gitDir, common)
+				}
+				gitDir = filepath.Clean(common)
+			} else if !errors.Is(commonErr, os.ErrNotExist) {
+				return "", "", false, fmt.Errorf("read Git common directory: %w", commonErr)
+			}
+			return root, gitDir, true, nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return "", "", false, fmt.Errorf("inspect %s: %w", dotGit, err)
+		}
+		parent := filepath.Dir(root)
+		if parent == root {
+			return "", "", false, nil
+		}
+		root = parent
+	}
+}
+
+func mergeGitExclude(content string, patterns []string) (string, error) {
+	lines := strings.Split(strings.ReplaceAll(content, "\r\n", "\n"), "\n")
+	entries := map[string]bool{}
+	base := make([]string, 0, len(lines))
+	inBlock := false
+	foundBlock := false
+	for _, line := range lines {
+		switch line {
+		case gitExcludeStart:
+			if inBlock || foundBlock {
+				return "", errors.New("Git exclude file contains multiple SkillTrim blocks")
+			}
+			inBlock, foundBlock = true, true
+		case gitExcludeEnd:
+			if !inBlock {
+				return "", errors.New("Git exclude file contains an unmatched SkillTrim marker")
+			}
+			inBlock = false
+		default:
+			if inBlock {
+				if value := strings.TrimSpace(line); value != "" {
+					entries[value] = true
+				}
+			} else {
+				base = append(base, line)
+			}
+		}
+	}
+	if inBlock {
+		return "", errors.New("Git exclude file contains an unclosed SkillTrim block")
+	}
+	for _, pattern := range patterns {
+		entries[pattern] = true
+	}
+	for len(base) > 0 && base[len(base)-1] == "" {
+		base = base[:len(base)-1]
+	}
+	if len(base) > 0 {
+		base = append(base, "")
+	}
+	base = append(base, gitExcludeStart)
+	base = append(base, sortedStringKeys(entries)...)
+	base = append(base, gitExcludeEnd, "")
+	return strings.Join(base, "\n"), nil
+}
+
+func uniqueFileChanges(changes []FileChange) ([]FileChange, error) {
+	result := make([]FileChange, 0, len(changes))
+	seen := map[string]FileChange{}
+	for _, change := range changes {
+		if previous, ok := seen[change.Path]; ok {
+			if string(previous.Content) != string(change.Content) {
+				return nil, fmt.Errorf("plans contain conflicting file changes for %s", change.Path)
+			}
+			continue
+		}
+		seen[change.Path] = change
+		result = append(result, change)
+	}
+	return result, nil
 }
 
 func selectedAgents(cfg config.File, selected string) ([]string, error) {
@@ -557,6 +946,15 @@ func contains(values []string, wanted string) bool {
 		}
 	}
 	return false
+}
+
+func sortedStringKeys(values map[string]bool) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func agentContext(cat core.Catalog, agent string) int {

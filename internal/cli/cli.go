@@ -64,6 +64,18 @@ type mutationResult struct {
 	Help    []string  `json:"help,omitempty"`
 }
 
+type moveResult struct {
+	Status      string              `json:"status"`
+	Skills      []string            `json:"skills"`
+	Agents      []string            `json:"agents"`
+	Projects    []string            `json:"projects"`
+	Plans       []engine.Plan       `json:"plans"`
+	FileChanges []engine.FileChange `json:"file_changes"`
+	Applied     int                 `json:"applied,omitempty"`
+	Snapshot    string              `json:"snapshot,omitempty"`
+	Help        []string            `json:"help,omitempty"`
+}
+
 func Run(args []string, stdout, stderr io.Writer) int {
 	_ = stderr
 	if len(args) == 1 && (args[0] == "-v" || args[0] == "-V" || args[0] == "--version") {
@@ -116,6 +128,8 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		return runMode(stdout, opts, cfg, commandArgs)
 	case "group":
 		return runGroup(stdout, opts, cfg, commandArgs)
+	case "move":
+		return runMove(stdout, opts, cfg, commandArgs)
 	case "plan":
 		return runPlan(stdout, opts, cfg, commandArgs)
 	case "apply":
@@ -127,7 +141,7 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	case "tui":
 		return runTUI(stdout, opts, cfg, commandArgs)
 	default:
-		return writeError(stdout, opts.toon, fmt.Errorf("unknown command %q", command), []string{"Valid commands: list, mode, group, plan, apply, rollback, doctor, tui."}, 2)
+		return writeError(stdout, opts.toon, fmt.Errorf("unknown command %q", command), []string{"Valid commands: list, mode, group, move, plan, apply, rollback, doctor, tui."}, 2)
 	}
 }
 
@@ -408,6 +422,261 @@ func groupDelete(writer io.Writer, opts options, cfg config.File, args []string)
 	return writeValue(writer, opts.toon, mutationResult{Changed: 1, Group: group.Name, Help: []string{"Affected grouped skills are now off. Run `skilltrim plan`."}})
 }
 
+func runMove(writer io.Writer, opts options, cfg config.File, args []string) int {
+	if len(args) > 0 && args[0] == "--help" {
+		fmt.Fprint(writer, moveHelp)
+		return 0
+	}
+	if opts.project != "" {
+		return writeError(writer, opts.toon, errors.New("`move` uses --to-project and does not accept --project"), []string{"Run `skilltrim move --help`."}, 2)
+	}
+	if opts.agent == "" {
+		return writeError(writer, opts.toon, errors.New("--agent is required for `move`"), []string{"Use --agent <name> or --agent all."}, 2)
+	}
+	if opts.agent != "all" {
+		if _, ok := cfg.Agents[opts.agent]; !ok {
+			return writeError(writer, opts.toon, fmt.Errorf("unknown agent %q", opts.agent), nil, 2)
+		}
+	}
+
+	pattern, projects, applyNow, err := parseMoveArgs(args)
+	if err != nil {
+		return writeError(writer, opts.toon, err, []string{"Run `skilltrim move --help`."}, 2)
+	}
+	home, err := homeDir()
+	if err != nil {
+		return writeError(writer, opts.toon, err, nil, 1)
+	}
+	for i, project := range projects {
+		projects[i] = config.Expand(project, home)
+		abs, err := filepath.Abs(projects[i])
+		if err != nil {
+			return writeError(writer, opts.toon, fmt.Errorf("resolve project %q: %w", projects[i], err), nil, 1)
+		}
+		info, err := os.Stat(abs)
+		if err != nil || !info.IsDir() {
+			return writeError(writer, opts.toon, fmt.Errorf("project is not a directory: %s", abs), nil, 1)
+		}
+		projects[i] = filepath.Clean(abs)
+	}
+	projects = uniqueSorted(projects)
+
+	globalCatalog, err := catalog.Scan(cfg, "")
+	if err != nil {
+		return writeError(writer, opts.toon, err, nil, 1)
+	}
+	matches, err := catalog.Match(globalCatalog, pattern)
+	if err != nil {
+		return writeError(writer, opts.toon, err, nil, 1)
+	}
+
+	next := cloneConfig(cfg)
+	agentSet := map[string]bool{}
+	assignments := map[string][]string{}
+	for _, skill := range matches {
+		if _, grouped := cfg.Group(skill.Name); grouped {
+			return writeError(writer, opts.toon, fmt.Errorf("%q is a generated group router", skill.Name), []string{"Move individual skills instead of the router."}, 1)
+		}
+		agents := moveAgents(cfg, skill, projects, opts.agent)
+		if len(agents) == 0 {
+			return writeError(writer, opts.toon, fmt.Errorf("skill %q is not globally active for selected agents", skill.Name), []string{"Choose an active agent or use `skilltrim list --agent <name>`."}, 1)
+		}
+		assignments[skill.Name] = agents
+		next.AddSource(filepath.Dir(skill.Source))
+		for _, agent := range agents {
+			agentSet[agent] = true
+			next.SetMode(skill.Name, agent, "global", core.ModeOff)
+			for _, project := range projects {
+				next.SetMode(skill.Name, agent, core.Scope(project), core.ModeAuto)
+			}
+		}
+	}
+	agents := sortedMapKeys(agentSet)
+
+	for _, project := range append([]string{""}, projects...) {
+		plan, err := buildScopePlan(cfg, agents, project)
+		if err != nil {
+			return writeError(writer, opts.toon, err, nil, 1)
+		}
+		if len(plan.Operations) > 0 || len(plan.Conflicts) > 0 {
+			return writeError(writer, opts.toon, errors.New("existing unapplied changes must be resolved before `move`"), []string{"Run `skilltrim plan` for global scope and each target project."}, 1)
+		}
+	}
+
+	plans := make([]engine.Plan, 0, len(projects)+1)
+	globalPlan, err := buildScopePlan(next, agents, "")
+	if err != nil {
+		return writeError(writer, opts.toon, err, nil, 1)
+	}
+	plans = append(plans, globalPlan)
+	for _, project := range projects {
+		plan, err := buildScopePlan(next, agents, project)
+		if err != nil {
+			return writeError(writer, opts.toon, err, nil, 1)
+		}
+		plans = append(plans, plan)
+	}
+
+	gitPaths := make(map[string][]string, len(projects))
+	for _, project := range projects {
+		paths := map[string]bool{}
+		for _, skill := range matches {
+			for _, agent := range assignments[skill.Name] {
+				targetDir, err := next.TargetDir(agent, project)
+				if err != nil {
+					return writeError(writer, opts.toon, err, nil, 1)
+				}
+				paths[filepath.Join(targetDir, skill.Name)] = true
+			}
+		}
+		gitPaths[project] = sortedMapKeys(paths)
+	}
+	files, err := engine.PlanGitExcludes(gitPaths)
+	if err != nil {
+		return writeError(writer, opts.toon, err, nil, 1)
+	}
+	encoded, err := config.Encode(next)
+	if err != nil {
+		return writeError(writer, opts.toon, err, nil, 1)
+	}
+	configChange, changed, err := engine.PlanFileChange(opts.configPath, encoded, "update SkillTrim configuration", 0o600)
+	if err != nil {
+		return writeError(writer, opts.toon, err, nil, 1)
+	}
+	if changed {
+		files = append(files, configChange)
+	}
+
+	result := moveResult{
+		Status: "preview", Skills: skillNames(matches), Agents: agents, Projects: projects,
+		Plans: plans, FileChanges: files, Help: []string{"Add --apply to perform this move."},
+	}
+	for _, plan := range plans {
+		if len(plan.Conflicts) > 0 {
+			result.Help = []string{"Resolve conflicts before applying."}
+			writeValue(writer, opts.toon, result)
+			return 1
+		}
+	}
+	if !applyNow {
+		return writeValue(writer, opts.toon, result)
+	}
+	applyResult, err := engine.ApplyMany(cfg, plans, files)
+	if err != nil {
+		return writeError(writer, opts.toon, err, []string{"No move was committed. Resolve the error and preview again."}, 1)
+	}
+	if applyResult.Noop {
+		result.Status = "noop"
+		result.Help = nil
+	} else {
+		result.Status = "applied"
+		result.Applied = applyResult.Applied
+		result.Snapshot = applyResult.Snapshot
+		result.Help = []string{"Run `skilltrim rollback` to restore the complete move."}
+	}
+	return writeValue(writer, opts.toon, result)
+}
+
+func parseMoveArgs(args []string) (string, []string, bool, error) {
+	var pattern string
+	var projects []string
+	applyNow := false
+	for i := 0; i < len(args); i++ {
+		switch {
+		case args[i] == "--apply":
+			applyNow = true
+		case args[i] == "--to-project":
+			if i+1 >= len(args) {
+				return "", nil, false, errors.New("--to-project requires a value")
+			}
+			i++
+			projects = append(projects, args[i])
+		case strings.HasPrefix(args[i], "--to-project="):
+			projects = append(projects, strings.TrimPrefix(args[i], "--to-project="))
+		case strings.HasPrefix(args[i], "-"):
+			return "", nil, false, fmt.Errorf("unknown flag %q for `move`", args[i])
+		case pattern == "":
+			pattern = args[i]
+		default:
+			return "", nil, false, fmt.Errorf("unexpected argument %q for `move`", args[i])
+		}
+	}
+	if pattern == "" || len(projects) == 0 {
+		return "", nil, false, errors.New("usage: skilltrim move <skill-or-glob> --to-project <path> [--to-project <path>...] --agent <name|all> [--apply]")
+	}
+	for _, project := range projects {
+		if strings.TrimSpace(project) == "" {
+			return "", nil, false, errors.New("--to-project requires a non-empty path")
+		}
+	}
+	return pattern, projects, applyNow, nil
+}
+
+func buildScopePlan(cfg config.File, agents []string, project string) (engine.Plan, error) {
+	cat, err := catalog.Scan(cfg, project)
+	if err != nil {
+		return engine.Plan{}, err
+	}
+	combined := engine.Plan{Scope: core.Scope(project), Context: []engine.ContextChange{}, Operations: []engine.Operation{}, Conflicts: []engine.Conflict{}}
+	for _, agent := range agents {
+		plan, err := engine.BuildPlan(cfg, cat, agent, project)
+		if err != nil {
+			return engine.Plan{}, err
+		}
+		combined.Context = append(combined.Context, plan.Context...)
+		combined.Operations = append(combined.Operations, plan.Operations...)
+		combined.Conflicts = append(combined.Conflicts, plan.Conflicts...)
+	}
+	return combined, nil
+}
+
+func moveAgents(cfg config.File, skill core.Skill, projects []string, selected string) []string {
+	candidates := map[string]bool{}
+	for _, agent := range skill.ActiveAgents {
+		candidates[agent] = true
+	}
+	for _, rule := range cfg.Rules {
+		if rule.Skill != skill.Name {
+			continue
+		}
+		for _, project := range projects {
+			if rule.Scope == core.Scope(project) {
+				candidates[rule.Agent] = true
+			}
+		}
+	}
+	if selected != "all" {
+		if candidates[selected] {
+			return []string{selected}
+		}
+		return nil
+	}
+	return sortedMapKeys(candidates)
+}
+
+func cloneConfig(cfg config.File) config.File {
+	result := cfg
+	result.Sources = append([]string(nil), cfg.Sources...)
+	result.Rules = append([]core.Rule(nil), cfg.Rules...)
+	result.Groups = append([]core.Group(nil), cfg.Groups...)
+	for i := range result.Groups {
+		result.Groups[i].Members = append([]string(nil), result.Groups[i].Members...)
+	}
+	result.Agents = make(map[string]core.Agent, len(cfg.Agents))
+	for name, agent := range cfg.Agents {
+		result.Agents[name] = agent
+	}
+	return result
+}
+
+func uniqueSorted(values []string) []string {
+	set := map[string]bool{}
+	for _, value := range values {
+		set[value] = true
+	}
+	return sortedMapKeys(set)
+}
+
 func runPlan(writer io.Writer, opts options, cfg config.File, args []string) int {
 	if len(args) != 0 {
 		return writeError(writer, opts.toon, fmt.Errorf("unknown argument %q for `plan`", args[0]), []string{"Valid flags: --agent, --project, --config, --toon."}, 2)
@@ -515,6 +784,14 @@ func parseOptions(args []string) (options, []string, error) {
 			opts.project = strings.TrimPrefix(arg, "--project=")
 		case strings.HasPrefix(arg, "--config="):
 			opts.configPath = strings.TrimPrefix(arg, "--config=")
+		case arg == "--to-project":
+			if i+1 >= len(args) {
+				return opts, nil, errors.New("--to-project requires a value")
+			}
+			rest = append(rest, arg, args[i+1])
+			i++
+		case strings.HasPrefix(arg, "--to-project=") || arg == "--apply":
+			rest = append(rest, arg)
 		default:
 			if strings.HasPrefix(arg, "-") && arg != "--full" && arg != "--force" {
 				return opts, nil, fmt.Errorf("unknown flag %q", arg)
@@ -628,6 +905,8 @@ func commandHelp(command string) string {
 		return modeHelp
 	case "group":
 		return groupHelp
+	case "move":
+		return moveHelp
 	case "plan":
 		return "usage: skilltrim plan [--agent <agent>] [--project <path>] [--toon]\nPreview exact filesystem changes.\n"
 	case "apply":
@@ -651,6 +930,7 @@ commands:
   list       List discovered skills
   mode       Set skill activation mode
   group      Manage router groups
+  move       Move global skills into projects
   plan       Preview filesystem changes
   apply      Apply configured changes
   rollback   Restore last applied filesystem state
@@ -687,4 +967,10 @@ commands:
   remove <name> <skill-or-glob>... Remove members and turn affected modes off
   list                             List groups and members
   delete <name> [--force]          Delete empty group, or disable members with --force
+`
+
+const moveHelp = `usage: skilltrim move <skill-or-glob> --to-project <path> [--to-project <path>...] --agent <name|all> [--apply]
+
+Move globally exposed skills into one or more projects.
+Preview by default. Add --apply to update config, links, and local Git exclusions under one rollback snapshot.
 `

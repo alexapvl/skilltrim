@@ -70,6 +70,44 @@ func TestMatchGlob(t *testing.T) {
 	}
 }
 
+func TestScanIgnoresGeneratedRoutersAsDuplicateSources(t *testing.T) {
+	home := t.TempDir()
+	canonical := filepath.Join(home, "canonical")
+	dataDir := filepath.Join(home, "data")
+	writeSkill(t, canonical, "suite", "Canonical router.")
+
+	agents := map[string]core.Agent{}
+	for _, agent := range []string{"claude", "codex", "cursor"} {
+		active := filepath.Join(home, agent)
+		if err := os.MkdirAll(active, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		target := canonical
+		if agent != "codex" {
+			target = filepath.Join(dataDir, "routers", agent)
+			writeSkill(t, target, "suite", "Generated router.")
+		}
+		if err := os.Symlink(filepath.Join(target, "suite"), filepath.Join(active, "suite")); err != nil {
+			t.Fatal(err)
+		}
+		agents[agent] = core.Agent{Name: agent, SkillsDir: active}
+	}
+
+	cfg := config.Default(home)
+	cfg.Sources = nil
+	cfg.Settings.DataDir = dataDir
+	cfg.Agents = agents
+	cat, err := Scan(cfg, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, warning := range cat.Warnings {
+		if warning.Code == "duplicate_skill" {
+			t.Fatalf("generated routers reported as duplicates: %#v", cat.Warnings)
+		}
+	}
+}
+
 func writeSkill(t *testing.T, root, name, description string) {
 	t.Helper()
 	dir := filepath.Join(root, name)

@@ -109,12 +109,9 @@ func (cfg *File) normalize(home string) {
 }
 
 func Save(path string, cfg File) error {
-	if err := cfg.Validate(); err != nil {
-		return err
-	}
-	data, err := toml.Marshal(cfg)
+	data, err := Encode(cfg)
 	if err != nil {
-		return fmt.Errorf("encode config: %w", err)
+		return err
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("create config directory: %w", err)
@@ -136,6 +133,17 @@ func Save(path string, cfg File) error {
 		return fmt.Errorf("replace config: %w", err)
 	}
 	return nil
+}
+
+func Encode(cfg File) ([]byte, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	data, err := toml.Marshal(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("encode config: %w", err)
+	}
+	return data, nil
 }
 
 func (cfg File) Validate() error {

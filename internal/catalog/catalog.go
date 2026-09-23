@@ -40,6 +40,10 @@ type occurrence struct {
 func Scan(cfg config.File, project string) (core.Catalog, error) {
 	var warnings []core.Warning
 	var occurrences []occurrence
+	generatedRoot := cfg.Settings.DataDir
+	if resolved, err := filepath.EvalSymlinks(generatedRoot); err == nil {
+		generatedRoot = resolved
+	}
 
 	for _, root := range cfg.Sources {
 		found, foundWarnings, err := scanRoot(root, "", true)
@@ -101,7 +105,7 @@ func Scan(cfg config.File, project string) (core.Catalog, error) {
 					implicitSet[item.activeAgent] = true
 				}
 			}
-			if !hasLibrarySource || item.isSource {
+			if (!hasLibrarySource || item.isSource) && !within(item.canonical, generatedRoot) {
 				sourceSet[item.canonical] = true
 			}
 		}

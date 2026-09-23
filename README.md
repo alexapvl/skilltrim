@@ -10,6 +10,19 @@ Agents receive the name and description of every visible skill in their startup 
 
 Skill package managers solve installation and updates, but not exposure. SkillTrim fills that gap: keep your full library installed, expose common skills automatically, put specialized skills behind explicit invocation or a group router, and hide unused skills without deleting them. Every filesystem change can be previewed and rolled back.
 
+## Case study
+
+One real setup exposed 54 skills to each of two agent integrations. Of those, 22 belonged to one specialized tool family. Keeping every member visible made discovery noisy and charged startup context for descriptions that were rarely relevant outside that workflow.
+
+SkillTrim grouped those 22 skills behind one router per integration. The original skills stayed installed and available, but each agent only needed to discover the router first. The change was previewed, applied as reversible symlink operations, and verified with a clean follow-up plan.
+
+| Integration | Visible skills | Context before | Context after | Estimated tokens saved |
+|---|---:|---:|---:|---:|
+| A | 54 → 33 | 21,422 chars | 15,069 chars | 1,588 |
+| B | 54 → 33 | 21,831 chars | 15,542 chars | 1,572 |
+
+Across both integrations, this removed 42 redundant catalog entries and saved 12,642 characters, or about 3,160 estimated tokens, from startup context. That is roughly a 29% reduction without uninstalling a skill. Token estimates use SkillTrim's approximation of four characters per token.
+
 ## Status
 
 Early development. Codex, Claude Code, Cursor, and OpenCode paths are supported on macOS and Linux. Explicit-only mode currently requires Codex or Claude Code.
@@ -29,6 +42,26 @@ go build -o skilltrim ./cmd/skilltrim
 ./skilltrim
 ```
 
+## Ask your agent to audit your skills
+
+After installing SkillTrim, copy this prompt into your coding agent:
+
+```text
+Use `skilltrim` to audit my installed agent skills. Start read-only.
+
+Inspect the dashboard, full skill catalog, diagnostics, and relevant local project manifests. Report:
+
+- current skill count and startup context for each agent
+- skills that should remain globally available
+- skills better scoped to one or more projects
+- related skills that could share a group router
+- skills better set to explicit-only or off
+- projected character and token savings
+- discovery tradeoffs for every recommendation
+
+Do not change configuration or skill links until I approve the recommendations. After approval, preview every operation, apply it, run diagnostics, and confirm that a follow-up plan contains no remaining operations or conflicts. Never edit or delete canonical skill sources.
+```
+
 ## Commands
 
 ```bash
@@ -37,6 +70,8 @@ skilltrim list --agent codex                   # discover skills and current mod
 skilltrim mode set craft-ui explicit --agent codex
 skilltrim group create asc
 skilltrim group add asc 'asc-*' --agent codex
+skilltrim move astro-framework --to-project ~/GitHub/site --agent all
+skilltrim move astro-framework --to-project ~/GitHub/site --agent all --apply
 skilltrim plan --agent codex                   # preview exact filesystem changes
 skilltrim apply --agent codex                  # apply and save rollback snapshot
 skilltrim rollback                             # restore complete last apply
@@ -61,6 +96,24 @@ Global and project-local scopes are separate from mode:
 skilltrim mode set deploy off --agent codex --project ~/GitHub/example
 skilltrim plan --agent codex --project ~/GitHub/example
 ```
+
+Move a global skill into one or more projects with one failure-safe transaction:
+
+```bash
+skilltrim move astro-framework \
+  --to-project ~/GitHub/site \
+  --to-project ~/GitHub/docs \
+  --agent all
+
+# Review the preview, then apply it.
+skilltrim move astro-framework \
+  --to-project ~/GitHub/site \
+  --to-project ~/GitHub/docs \
+  --agent all \
+  --apply
+```
+
+`move` previews by default. Applying disables the selected global links, creates project-local links, updates the config, and adds only those generated paths to each repository's local `.git/info/exclude`. Nothing is added to the repository's tracked `.gitignore`.
 
 Without `--agent`, read commands show all agents and `plan` or `apply` handles all configured agents. `mode set` requires one explicit agent to avoid accidental cross-agent changes.
 
@@ -125,6 +178,7 @@ CLI mutations write this config atomically. Skill source parents are recorded au
 - SkillTrim only creates, replaces, or removes symlinks in configured agent skill directories.
 - Real files and directories cause plan conflicts and remain untouched.
 - Every non-empty apply stores one rollback snapshot at `~/.local/state/skilltrim/latest.json`.
+- A project move stores global links, project links, config, and local Git exclusions in one rollback snapshot. Rollback also removes activation directories created by the move when they are still empty.
 - Rollback refuses to overwrite paths changed after apply.
 - `plan` performs no writes.
 
