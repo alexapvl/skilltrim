@@ -126,8 +126,13 @@ func BuildPlan(cfg config.File, cat core.Catalog, selectedAgent, project string)
 			modes[skill.Name] = mode
 			configured[skill.Name] = hasRule
 			if mode.IsGroup() {
-				if _, ok := cfg.Group(mode.Group()); !ok {
+				group, ok := cfg.Group(mode.Group())
+				if !ok {
 					plan.Conflicts = append(plan.Conflicts, Conflict{Agent: agent, Path: filepath.Join(targetDir, skill.Name), Message: fmt.Sprintf("group %q is not configured", mode.Group())})
+					continue
+				}
+				if !group.VisibleIn(scope) {
+					plan.Conflicts = append(plan.Conflicts, Conflict{Agent: agent, Path: filepath.Join(targetDir, skill.Name), Message: fmt.Sprintf("group %q is limited to other projects", group.Name)})
 					continue
 				}
 				groups[mode.Group()] = append(groups[mode.Group()], skill)
@@ -179,13 +184,24 @@ func BuildPlan(cfg config.File, cat core.Catalog, selectedAgent, project string)
 		sort.Strings(groupNames)
 		for _, groupName := range groupNames {
 			group, _ := cfg.Group(groupName)
-			router := filepath.Join(cfg.Settings.DataDir, "routers", agent, groupName)
-			desiredGenerated[router] = true
 			content, policy := routerContent(agent, group, groups[groupName])
-			planGenerated(&plan, agent, router, "write_router", content, policy, "prepare group router")
 			routerDestination := filepath.Join(targetDir, groupName)
-			planLink(&plan, agent, routerDestination, router, "expose group router")
-			if agent != "codex" && agent != "claude" {
+			// Cursor skips skill symlinks whose target leaves the repo, so a project
+			// router has to be a real directory under .cursor/skills.
+			if agent == "cursor" && len(group.Projects) > 0 {
+				if info, err := os.Lstat(routerDestination); err == nil && info.Mode()&os.ModeSymlink != 0 {
+					if target, err := resolvedLink(routerDestination); err == nil {
+						desiredGenerated[target] = true
+					}
+				}
+				planGenerated(&plan, agent, routerDestination, "write_router", content, policy, "write project router inside the repo")
+			} else {
+				router := filepath.Join(cfg.Settings.DataDir, "routers", agent, groupName)
+				desiredGenerated[router] = true
+				planGenerated(&plan, agent, router, "write_router", content, policy, "prepare group router")
+				planLink(&plan, agent, routerDestination, router, "expose group router")
+			}
+			if routerCountsInStartup(agent, group) {
 				description := group.Description
 				if description == "" {
 					description = fmt.Sprintf("Explicit router for %s skills.", group.Name)
@@ -442,12 +458,19 @@ func planAbsent(plan *Plan, agent, path, reason string) {
 
 func planGenerated(plan *Plan, agent, path, action, content, policy, reason string) {
 	info, statErr := os.Lstat(path)
+	replacingSymlink := false
 	if statErr == nil {
-		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		if info.Mode()&os.ModeSymlink != 0 {
+			target, err := resolvedLink(path)
+			if err != nil || !isSkilltrimRouter(target) {
+				plan.Conflicts = append(plan.Conflicts, Conflict{Agent: agent, Path: path, Message: "refusing to replace unowned generated path"})
+				return
+			}
+			replacingSymlink = true
+		} else if !info.IsDir() {
 			plan.Conflicts = append(plan.Conflicts, Conflict{Agent: agent, Path: path, Message: "refusing to replace unowned generated path"})
 			return
-		}
-		if _, err := os.Stat(filepath.Join(path, generatedMarker)); err != nil {
+		} else if _, err := os.Stat(filepath.Join(path, generatedMarker)); err != nil {
 			plan.Conflicts = append(plan.Conflicts, Conflict{Agent: agent, Path: path, Message: "generated directory lacks skilltrim ownership marker"})
 			return
 		}
@@ -459,7 +482,7 @@ func planGenerated(plan *Plan, agent, path, action, content, policy, reason stri
 	policyCurrent, policyErr := os.ReadFile(filepath.Join(path, "agents", "openai.yaml"))
 	policyChanged := policy != "" && (policyErr != nil || string(policyCurrent) != policy)
 	policyStale := policy == "" && policyErr == nil
-	if err == nil && string(current) == content && !policyChanged && !policyStale {
+	if err == nil && string(current) == content && !policyChanged && !policyStale && !replacingSymlink {
 		return
 	}
 	plan.Operations = append(plan.Operations, Operation{Action: action, Agent: agent, Path: path, Reason: reason, content: content, policy: policy})
@@ -497,13 +520,27 @@ func proxyContent(agent string, skill core.Skill) (string, string) {
 	return content, policy
 }
 
+func routerCountsInStartup(agent string, group core.Group) bool {
+	if len(group.Projects) > 0 {
+		return true
+	}
+	switch agent {
+	case "codex", "claude":
+		return false
+	default:
+		return true
+	}
+}
+
 func routerContent(agent string, group core.Group, skills []core.Skill) (string, string) {
 	description := group.Description
 	if description == "" {
 		description = fmt.Sprintf("Explicit router for %s skills.", group.Name)
 	}
+	// Project routers stay in context so the model can select them, and they stay
+	// addressable so the user can invoke them. Global routers stay explicit.
 	disable := ""
-	if agent == "claude" {
+	if len(group.Projects) == 0 && agent == "claude" {
 		disable = "disable-model-invocation: true\n"
 	}
 	var body strings.Builder
@@ -513,18 +550,29 @@ func routerContent(agent string, group core.Group, skills []core.Skill) (string,
 		fmt.Fprintf(&body, "- `%s`: %s (`%s`)\n", skill.Name, oneLine(skill.Description), filepath.Join(skill.Source, "SKILL.md"))
 	}
 	policy := ""
-	if agent == "codex" {
+	if len(group.Projects) == 0 && agent == "codex" {
 		policy = "policy:\n  allow_implicit_invocation: false\n"
 	}
 	return body.String(), policy
 }
 
+func isSkilltrimRouter(path string) bool {
+	return strings.Contains(filepath.ToSlash(path), "/skilltrim/routers/")
+}
+
 func writeGenerated(path, content, policy string) error {
 	if info, err := os.Lstat(path); err == nil {
-		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		if info.Mode()&os.ModeSymlink != 0 {
+			target, err := resolvedLink(path)
+			if err != nil || !isSkilltrimRouter(target) {
+				return fmt.Errorf("refusing to replace unowned generated path %s", path)
+			}
+			if err := os.Remove(path); err != nil {
+				return fmt.Errorf("remove router symlink %s: %w", path, err)
+			}
+		} else if !info.IsDir() {
 			return fmt.Errorf("refusing to replace unowned generated path %s", path)
-		}
-		if _, err := os.Stat(filepath.Join(path, generatedMarker)); err != nil {
+		} else if _, err := os.Stat(filepath.Join(path, generatedMarker)); err != nil {
 			return fmt.Errorf("generated directory lacks skilltrim ownership marker: %s", path)
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {

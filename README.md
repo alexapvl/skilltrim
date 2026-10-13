@@ -85,6 +85,8 @@ skilltrim list --agent codex                   # discover skills and current mod
 skilltrim mode set craft-ui explicit --agent codex
 skilltrim group create asc
 skilltrim group add asc 'asc-*' --agent codex
+skilltrim group create diri --project ~/GitHub/diri --description "Skills for the diri repository."
+skilltrim group add diri diri-review --agent all
 skilltrim move astro-framework --to-project ~/GitHub/site --agent all
 skilltrim move astro-framework --to-project ~/GitHub/site --agent all --apply
 skilltrim plan --agent codex                   # preview exact filesystem changes
@@ -129,6 +131,8 @@ skilltrim move astro-framework \
 ```
 
 `move` previews by default. Applying disables the selected global links, creates project-local links, updates the config, and adds only those generated paths to each repository's local `.git/info/exclude`. Nothing is added to the repository's tracked `.gitignore`.
+
+A project-bound group is the same idea for a set of skills. Bind the group with repeatable `--project` flags. Adding a member with `--agent` turns that skill off in the global catalog and exposes the group router only inside the bound repositories. The model can select that router, and the user can invoke it with `/<group>`. Cursor writes it as a real directory at `<repo>/.cursor/skills/<group>` so both of those work. The same skill can belong to more than one project group. Skills used in every repository stay global and are not group members. `apply --project` records new project paths in that repo's local Git exclude.
 
 Without `--agent`, read commands show all agents and `plan` or `apply` handles all configured agents. `mode set` requires one explicit agent to avoid accidental cross-agent changes.
 
@@ -177,6 +181,12 @@ skills_dir = "~/.claude/skills"
 [[groups]]
 name = "asc"
 members = ["asc-build-lifecycle", "asc-testflight"]
+
+[[groups]]
+name = "diri"
+description = "Skills for the diri repository."
+projects = ["/Users/alex/GitHub/diri"]
+members = []
 
 [[rules]]
 skill = "asc-testflight"

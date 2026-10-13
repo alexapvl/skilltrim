@@ -228,6 +228,54 @@ func TestCLIMoveAcrossProjectsAndRollback(t *testing.T) {
 	}
 }
 
+func TestCLIProjectGroupAddHidesSkillGlobally(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("SKILLTRIM_HOME", home)
+	library := filepath.Join(home, ".local", "share", "agent-skills")
+	active := filepath.Join(home, ".agents", "skills")
+	writeSkill(t, library, "release")
+	if err := os.MkdirAll(active, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(library, "release"), filepath.Join(active, "release")); err != nil {
+		t.Fatal(err)
+	}
+	project := filepath.Join(home, "repo")
+	excludeDir := filepath.Join(project, ".git", "info")
+	if err := os.MkdirAll(excludeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(excludeDir, "exclude"), []byte("existing\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if code, stdout := run(t, "group", "create", "repo", "--project", project, "--description", "Skills for repo."); code != 0 || !strings.Contains(stdout, `"changed":1`) {
+		t.Fatalf("create code = %d: %s", code, stdout)
+	}
+	if code, stdout := run(t, "group", "add", "repo", "release", "--agent", "codex"); code != 0 || !strings.Contains(stdout, `"changed":1`) {
+		t.Fatalf("add code = %d: %s", code, stdout)
+	}
+	if code, stdout := run(t, "apply", "--agent", "codex"); code != 0 {
+		t.Fatalf("global apply code = %d: %s", code, stdout)
+	}
+	if _, err := os.Lstat(filepath.Join(active, "release")); !os.IsNotExist(err) {
+		t.Fatalf("release should be hidden globally: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(active, "repo")); !os.IsNotExist(err) {
+		t.Fatalf("project router should not be global: %v", err)
+	}
+	if code, stdout := run(t, "apply", "--agent", "codex", "--project", project); code != 0 {
+		t.Fatalf("project apply code = %d: %s", code, stdout)
+	}
+	if _, err := os.Stat(filepath.Join(project, ".agents", "skills", "repo", "SKILL.md")); err != nil {
+		t.Fatalf("project router missing: %v", err)
+	}
+	exclude, err := os.ReadFile(filepath.Join(excludeDir, "exclude"))
+	if err != nil || !strings.Contains(string(exclude), "existing\n") || !strings.Contains(string(exclude), "/.agents/skills/repo") {
+		t.Fatalf("exclude = %q, err = %v", exclude, err)
+	}
+}
+
 func TestVersionIsBare(t *testing.T) {
 	code, stdout := run(t, "--version")
 	if code != 0 || stdout != "0.1.0\n" {

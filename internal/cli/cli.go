@@ -276,17 +276,27 @@ func runGroup(writer io.Writer, opts options, cfg config.File, args []string) in
 	}
 	switch args[0] {
 	case "create":
-		if len(args) != 2 || !core.ValidName(args[1]) {
-			return writeError(writer, opts.toon, errors.New("usage: skilltrim group create <name>"), nil, 2)
+		group, err := parseGroupCreate(args[1:])
+		if err != nil {
+			return writeError(writer, opts.toon, err, nil, 2)
 		}
-		if _, exists := cfg.Group(args[1]); exists {
-			return writeValue(writer, opts.toon, mutationResult{Noop: true, Group: args[1]})
+		if existing, exists := cfg.Group(group.Name); exists {
+			if group.Description == "" && len(group.Projects) == 0 {
+				return writeValue(writer, opts.toon, mutationResult{Noop: true, Group: group.Name})
+			}
+			if group.Description != "" {
+				existing.Description = group.Description
+			}
+			if len(group.Projects) > 0 {
+				existing.Projects = mergeProjects(existing.Projects, group.Projects)
+			}
+			group = existing
 		}
-		cfg.SetGroup(core.Group{Name: args[1], Members: []string{}})
+		cfg.SetGroup(group)
 		if err := config.Save(opts.configPath, cfg); err != nil {
 			return writeError(writer, opts.toon, err, nil, 1)
 		}
-		return writeValue(writer, opts.toon, mutationResult{Changed: 1, Group: args[1], Help: []string{fmt.Sprintf("Run `skilltrim group add %s <skill-or-glob>`.", args[1])}})
+		return writeValue(writer, opts.toon, mutationResult{Changed: 1, Group: group.Name, Help: []string{fmt.Sprintf("Run `skilltrim group add %s <skill-or-glob> --agent all`.", group.Name)}})
 	case "add":
 		return groupAdd(writer, opts, cfg, args[1:])
 	case "remove":
@@ -327,6 +337,14 @@ func groupAdd(writer io.Writer, opts options, cfg config.File, args []string) in
 	if err != nil {
 		return writeError(writer, opts.toon, err, nil, 1)
 	}
+	agents, err := groupAgents(cfg, opts.agent)
+	if err != nil {
+		return writeError(writer, opts.toon, err, nil, 2)
+	}
+	scopes, globalOff, err := groupAddScopes(group, opts.project)
+	if err != nil {
+		return writeError(writer, opts.toon, err, nil, 2)
+	}
 	changed := 0
 	for _, skill := range matched {
 		cfg.AddSource(filepath.Dir(skill.Source))
@@ -334,8 +352,13 @@ func groupAdd(writer io.Writer, opts options, cfg config.File, args []string) in
 			group.Members = append(group.Members, skill.Name)
 			changed++
 		}
-		if opts.agent != "" && opts.agent != "all" {
-			cfg.SetMode(skill.Name, opts.agent, core.Scope(opts.project), core.Mode("group:"+group.Name))
+		for _, agent := range agents {
+			if globalOff {
+				cfg.SetMode(skill.Name, agent, "global", core.ModeOff)
+			}
+			for _, scope := range scopes {
+				cfg.SetMode(skill.Name, agent, scope, core.Mode("group:"+group.Name))
+			}
 		}
 	}
 	sort.Strings(group.Members)
@@ -344,6 +367,115 @@ func groupAdd(writer io.Writer, opts options, cfg config.File, args []string) in
 		return writeError(writer, opts.toon, err, nil, 1)
 	}
 	return writeValue(writer, opts.toon, mutationResult{Changed: changed, Noop: changed == 0, Skills: skillNames(matched), Group: group.Name, Agent: opts.agent, Help: []string{"Pass `--agent <agent>` to assign group mode while adding.", "Run `skilltrim plan` to preview filesystem changes."}})
+}
+
+func groupAgents(cfg config.File, agent string) ([]string, error) {
+	switch agent {
+	case "":
+		return nil, nil
+	case "all":
+		return cfg.AgentNames(), nil
+	default:
+		if _, ok := cfg.Agents[agent]; !ok {
+			return nil, fmt.Errorf("unknown agent %q", agent)
+		}
+		return []string{agent}, nil
+	}
+}
+
+func groupAddScopes(group core.Group, project string) ([]string, bool, error) {
+	if project != "" {
+		scope := core.Scope(project)
+		if len(group.Projects) > 0 && !contains(group.Projects, scope) {
+			return nil, false, fmt.Errorf("project %s is not bound to group %q", scope, group.Name)
+		}
+		return []string{scope}, len(group.Projects) > 0, nil
+	}
+	if len(group.Projects) > 0 {
+		return append([]string(nil), group.Projects...), true, nil
+	}
+	return []string{"global"}, false, nil
+}
+
+func commandParts(args []string) (string, string) {
+	var parts []string
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if strings.HasPrefix(arg, "-") {
+			switch arg {
+			case "--agent", "--project", "--config", "--description", "--to-project":
+				i++
+			}
+			continue
+		}
+		parts = append(parts, arg)
+		if len(parts) == 2 {
+			break
+		}
+	}
+	if len(parts) == 0 {
+		return "", ""
+	}
+	if len(parts) == 1 {
+		return parts[0], parts[0]
+	}
+	return parts[0], parts[0] + " " + parts[1]
+}
+
+func parseGroupCreate(args []string) (core.Group, error) {
+	group := core.Group{}
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case strings.HasPrefix(arg, "--project="):
+			group.Projects = append(group.Projects, core.Scope(strings.TrimPrefix(arg, "--project=")))
+		case strings.HasPrefix(arg, "--description="):
+			group.Description = strings.TrimPrefix(arg, "--description=")
+		case arg == "--project":
+			if i+1 >= len(args) {
+				return core.Group{}, errors.New("--project requires a value")
+			}
+			i++
+			if strings.TrimSpace(args[i]) == "" {
+				return core.Group{}, errors.New("--project requires a non-empty path")
+			}
+			group.Projects = append(group.Projects, core.Scope(args[i]))
+		case arg == "--description":
+			if i+1 >= len(args) {
+				return core.Group{}, errors.New("--description requires a value")
+			}
+			i++
+			group.Description = args[i]
+		case strings.HasPrefix(arg, "-"):
+			return core.Group{}, fmt.Errorf("unknown flag %q for `group create`", arg)
+		case group.Name == "":
+			if !core.ValidName(arg) {
+				return core.Group{}, fmt.Errorf("invalid group name %q", arg)
+			}
+			group.Name = arg
+		default:
+			return core.Group{}, fmt.Errorf("unexpected argument %q for `group create`", arg)
+		}
+	}
+	if group.Name == "" {
+		return core.Group{}, errors.New("usage: skilltrim group create <name> [--project <path>]... [--description <text>]")
+	}
+	group.Projects = mergeProjects(nil, group.Projects)
+	return group, nil
+}
+
+func mergeProjects(existing, extra []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(existing)+len(extra))
+	for _, project := range append(append([]string{}, existing...), extra...) {
+		if project == "" || seen[project] {
+			continue
+		}
+		seen[project] = true
+		out = append(out, project)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func groupRemove(writer io.Writer, opts options, cfg config.File, args []string) int {
@@ -661,6 +793,7 @@ func cloneConfig(cfg config.File) config.File {
 	result.Groups = append([]core.Group(nil), cfg.Groups...)
 	for i := range result.Groups {
 		result.Groups[i].Members = append([]string(nil), result.Groups[i].Members...)
+		result.Groups[i].Projects = append([]string(nil), result.Groups[i].Projects...)
 	}
 	result.Agents = make(map[string]core.Agent, len(cfg.Agents))
 	for name, agent := range cfg.Agents {
@@ -708,7 +841,27 @@ func runApply(writer io.Writer, opts options, cfg config.File, args []string) in
 	if err != nil {
 		return writeError(writer, opts.toon, err, nil, 2)
 	}
-	result, err := engine.Apply(cfg, plan)
+	var files []engine.FileChange
+	if opts.project != "" && len(plan.Conflicts) == 0 {
+		projectRoot := core.Scope(opts.project)
+		var paths []string
+		for _, op := range plan.Operations {
+			inside := op.Path == projectRoot || strings.HasPrefix(op.Path, projectRoot+string(os.PathSeparator))
+			if !inside {
+				continue
+			}
+			if op.Action == "create_link" || op.Action == "replace_link" || op.Action == "write_router" {
+				paths = append(paths, op.Path)
+			}
+		}
+		if len(paths) > 0 {
+			files, err = engine.PlanGitExcludes(map[string][]string{core.Scope(opts.project): paths})
+			if err != nil {
+				return writeError(writer, opts.toon, err, nil, 1)
+			}
+		}
+	}
+	result, err := engine.ApplyMany(cfg, []engine.Plan{plan}, files)
 	if err != nil {
 		return writeError(writer, opts.toon, err, []string{"Run `skilltrim plan` and resolve conflicts."}, 1)
 	}
@@ -765,6 +918,8 @@ func runTUI(writer io.Writer, opts options, cfg config.File, args []string) int 
 func parseOptions(args []string) (options, []string, error) {
 	var opts options
 	rest := make([]string, 0, len(args))
+	_, subcommand := commandParts(args)
+	groupCreate := subcommand == "group create"
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		switch {
@@ -772,6 +927,16 @@ func parseOptions(args []string) (options, []string, error) {
 			opts.toon = true
 		case arg == "--help" || arg == "-h":
 			opts.help = true
+		case groupCreate && (arg == "--project" || arg == "--description"):
+			if i+1 >= len(args) {
+				return opts, nil, fmt.Errorf("%s requires a value", arg)
+			}
+			rest = append(rest, arg, args[i+1])
+			i++
+		case strings.HasPrefix(arg, "--project=") && groupCreate:
+			rest = append(rest, arg)
+		case strings.HasPrefix(arg, "--description=") && groupCreate:
+			rest = append(rest, arg)
 		case arg == "--agent" || arg == "--project" || arg == "--config":
 			if i+1 >= len(args) {
 				return opts, nil, fmt.Errorf("%s requires a value", arg)
@@ -962,8 +1127,10 @@ modes:
 const groupHelp = `usage: skilltrim group <command>
 
 commands:
-  create <name>                    Create empty router group
-  add <name> <skill-or-glob>...    Add members; --agent also assigns group mode
+  create <name> [--project <path>]... [--description <text>]
+                                   Create a group. Repeat --project to bind it to repos.
+  add <name> <skill-or-glob>...    Add members. --agent assigns group mode.
+                                   A project-bound group is hidden globally and linked in each bound repo.
   remove <name> <skill-or-glob>... Remove members and turn affected modes off
   list                             List groups and members
   delete <name> [--force]          Delete empty group, or disable members with --force

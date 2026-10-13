@@ -63,7 +63,22 @@ type Rule struct {
 type Group struct {
 	Name        string   `toml:"name" json:"name"`
 	Description string   `toml:"description,omitempty" json:"description,omitempty"`
+	Projects    []string `toml:"projects,omitempty" json:"projects,omitempty"`
 	Members     []string `toml:"members,omitempty" json:"members"`
+}
+
+// VisibleIn reports whether this group's router belongs in scope.
+// A group with no projects is global. A project group is visible only inside its repos.
+func (g Group) VisibleIn(scope string) bool {
+	if len(g.Projects) == 0 {
+		return true
+	}
+	for _, project := range g.Projects {
+		if project == scope {
+			return true
+		}
+	}
+	return false
 }
 
 type TargetStatus struct {

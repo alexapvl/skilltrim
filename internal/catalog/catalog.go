@@ -263,7 +263,7 @@ func scanRoot(root, activeAgent string, isSource bool) ([]occurrence, []core.War
 }
 
 func isImplicit(agent string, meta frontmatter, canonical string) bool {
-	if agent == "claude" && meta.DisableModelInvocation {
+	if (agent == "claude" || agent == "cursor") && meta.DisableModelInvocation {
 		return false
 	}
 	if agent != "codex" {

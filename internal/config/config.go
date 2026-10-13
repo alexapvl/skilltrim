@@ -105,6 +105,18 @@ func (cfg *File) normalize(home string) {
 	}
 	for i := range cfg.Groups {
 		sort.Strings(cfg.Groups[i].Members)
+		projects := cfg.Groups[i].Projects[:0]
+		seen := map[string]bool{}
+		for _, project := range cfg.Groups[i].Projects {
+			project = core.Scope(Expand(project, home))
+			if project == "" || project == "global" || seen[project] {
+				continue
+			}
+			seen[project] = true
+			projects = append(projects, project)
+		}
+		sort.Strings(projects)
+		cfg.Groups[i].Projects = projects
 	}
 }
 

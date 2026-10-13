@@ -137,6 +137,152 @@ func TestGeneratedRouterHidesMembers(t *testing.T) {
 	}
 }
 
+func TestProjectGroupRouterStaysInsideBoundRepo(t *testing.T) {
+	home := t.TempDir()
+	cfg, library, globalActive := testConfig(t, home)
+	writeSkill(t, library, "release", "Ship the app")
+	if err := os.MkdirAll(globalActive, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(library, "release"), filepath.Join(globalActive, "release")); err != nil {
+		t.Fatal(err)
+	}
+	project := filepath.Join(home, "app")
+	other := filepath.Join(home, "other")
+	cfg.SetGroup(core.Group{
+		Name: "app", Description: "Skills for the app repository.",
+		Projects: []string{project}, Members: []string{"release"},
+	})
+	cfg.SetMode("release", "codex", "global", core.ModeOff)
+	cfg.SetMode("release", "codex", project, core.Mode("group:app"))
+
+	globalCat, err := catalog.Scan(cfg, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	globalPlan, err := BuildPlan(cfg, globalCat, "codex", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(globalPlan.Conflicts) != 0 {
+		t.Fatalf("global conflicts = %#v", globalPlan.Conflicts)
+	}
+	for _, op := range globalPlan.Operations {
+		if strings.Contains(op.Path, "routers") || strings.HasSuffix(op.Path, "/app") {
+			t.Fatalf("global plan exposed project router: %#v", op)
+		}
+	}
+
+	projectCat, err := catalog.Scan(cfg, project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	projectPlan, err := BuildPlan(cfg, projectCat, "codex", project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(projectPlan.Conflicts) != 0 {
+		t.Fatalf("project conflicts = %#v", projectPlan.Conflicts)
+	}
+	if _, err := Apply(cfg, projectPlan); err != nil {
+		t.Fatal(err)
+	}
+	router := filepath.Join(project, ".agents", "skills", "app", "SKILL.md")
+	data, err := os.ReadFile(router)
+	if err != nil || !strings.Contains(string(data), "release") {
+		t.Fatalf("router = %s, err = %v", data, err)
+	}
+	if _, err := os.Lstat(filepath.Join(other, ".agents", "skills", "app")); !os.IsNotExist(err) {
+		t.Fatalf("router leaked into unbound project: %v", err)
+	}
+}
+
+func TestCursorProjectRouterIsSlashInvocable(t *testing.T) {
+	home := t.TempDir()
+	cfg, library, _ := testConfig(t, home)
+	active := filepath.Join(home, "cursor-skills")
+	cfg.Agents = map[string]core.Agent{"cursor": {Name: "cursor", SkillsDir: active}}
+	writeSkill(t, library, "release", "Ship the app")
+	project := filepath.Join(home, "app")
+	cfg.SetGroup(core.Group{
+		Name: "app", Description: "Skills for the app repository.",
+		Projects: []string{project}, Members: []string{"release"},
+	})
+	cfg.SetMode("release", "cursor", "global", core.ModeOff)
+	cfg.SetMode("release", "cursor", project, core.Mode("group:app"))
+	cat, err := catalog.Scan(cfg, project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := BuildPlan(cfg, cat, "cursor", project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Context) != 1 || plan.Context[0].AfterChars == 0 {
+		t.Fatalf("context = %#v", plan.Context)
+	}
+	if _, err := Apply(cfg, plan); err != nil {
+		t.Fatal(err)
+	}
+	router := filepath.Join(project, ".cursor", "skills", "app")
+	info, err := os.Lstat(router)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		t.Fatalf("cursor project router should be a real directory, mode = %v", info.Mode())
+	}
+	data, err := os.ReadFile(filepath.Join(router, "SKILL.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "disable-model-invocation") {
+		t.Fatalf("project router should stay model-invocable:\n%s", data)
+	}
+	group := core.Group{Name: "app", Projects: []string{project}}
+	skills := []core.Skill{{Name: "release", Description: "Ship the app", Source: filepath.Join(library, "release")}}
+	claude, _ := routerContent("claude", group, skills)
+	if strings.Contains(claude, "disable-model-invocation") {
+		t.Fatalf("claude project router = %s", claude)
+	}
+	_, policy := routerContent("codex", group, skills)
+	if policy != "" {
+		t.Fatalf("codex project router policy = %q", policy)
+	}
+
+	outside := filepath.Join(cfg.Settings.DataDir, "routers", "cursor", "app")
+	if err := os.MkdirAll(outside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outside, "SKILL.md"), []byte("old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(router); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, router); err != nil {
+		t.Fatal(err)
+	}
+	plan, err = BuildPlan(cfg, cat, "cursor", project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Apply(cfg, plan); err != nil {
+		t.Fatal(err)
+	}
+	info, err = os.Lstat(router)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		t.Fatalf("symlink router was not replaced with a directory: %v", info.Mode())
+	}
+	plan, err = BuildPlan(cfg, cat, "cursor", project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Operations) != 0 || len(plan.Conflicts) != 0 {
+		t.Fatalf("second plan = %#v", plan)
+	}
+}
+
 func TestRefusesRealDirectory(t *testing.T) {
 	home := t.TempDir()
 	cfg, library, active := testConfig(t, home)
